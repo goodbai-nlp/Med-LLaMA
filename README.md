@@ -1,2 +1,2 @@
 # Med-LLaMA
-The official implement for PubMedLLaMA.
+The official implement for Med-LLaMA.
