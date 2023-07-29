@@ -36,6 +36,7 @@ from transformers.utils import (
     get_full_repo_name,
     is_accelerate_available,
     is_apex_available,
+    is_peft_available,
     is_datasets_available,
     is_in_notebook,
     is_ipex_available,
@@ -49,7 +50,6 @@ from transformers.utils import (
     strtobool,
 )
 from transformers.integrations import (
-    default_hp_search_backend,
     get_reporting_integration_callbacks,
     hp_params,
     is_fairscale_available,
@@ -77,7 +77,6 @@ from transformers.trainer_utils import (
     TrainerMemoryTracker,
     TrainOutput,
     default_compute_objective,
-    default_hp_space,
     denumpify_detensorize,
     enable_full_determinism,
     find_executable_batch_size,
@@ -157,7 +156,20 @@ if is_fairscale_available():
     # from fairscale.nn.wrap import auto_wrap
     from fairscale.optim import OSS
     # from fairscale.optim.grad_scaler import ShardedGradScaler
-    
+
+if is_accelerate_available():
+    from accelerate import Accelerator, skip_first_batches
+    from accelerate import __version__ as accelerate_version
+    from accelerate.utils import DistributedDataParallelKwargs, GradientAccumulationPlugin
+
+    if version.parse(accelerate_version) > version.parse("0.20.3"):
+        from accelerate.utils import (
+            load_fsdp_model,
+            load_fsdp_optimizer,
+            save_fsdp_model,
+            save_fsdp_optimizer,
+        )
+        
 logger = logging.get_logger(__name__)
 
 
@@ -234,7 +246,6 @@ class LMTrainer(Trainer):
                     "weight_decay": 0.0,
                 },
             ]
-            
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
             if self.sharded_ddp == ShardedDDPOption.SIMPLE:
@@ -254,10 +265,10 @@ class LMTrainer(Trainer):
                     for module in opt_model.modules():
                         if isinstance(module, nn.Embedding):
                             skipped += sum({p.data_ptr(): p.numel() for p in module.parameters()}.values())
-                            print(f"skipped {module}: {skipped/2**20}M params")
+                            logger.info(f"skipped {module}: {skipped/2**20}M params")
                             manager.register_module_override(module, "weight", {"optim_bits": 32})
                             logger.debug(f"bitsandbytes: will optimize {module} in fp32")
-                    print(f"skipped: {skipped/2**20}M params")
+                    logger.info(f"skipped: {skipped/2**20}M params")
 
         if is_sagemaker_mp_enabled():
             self.optimizer = smp.DistributedOptimizer(self.optimizer)
@@ -280,8 +291,9 @@ class LMTrainer(Trainer):
                 num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
                 num_training_steps=num_training_steps,
             )
+            self._created_lr_scheduler = True
         return self.lr_scheduler
-
+    
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -305,7 +317,7 @@ class LMTrainer(Trainer):
         if not self.saved_dummy:
             save_dummy_batch(inputs, self.tokenizer, self.args.output_dir, cate="train")
             self.saved_dummy = True
-        
+            
         if is_sagemaker_mp_enabled():
             loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
             return loss_mb.reduce_mean().detach().to(self.args.device)
@@ -316,23 +328,16 @@ class LMTrainer(Trainer):
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
-            # deepspeed handles loss scaling by gradient_accumulation_steps in its `backward`
-            loss = loss / self.args.gradient_accumulation_steps
-
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()
         elif self.use_apex:
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
-        elif self.deepspeed:
-            # loss gets scaled under gradient_accumulation_steps in deepspeed
-            loss = self.deepspeed.backward(loss)
         else:
-            loss.backward()
+            self.accelerator.backward(loss)
 
-        return loss.detach()
-
+        return loss.detach() / self.args.gradient_accumulation_steps
+    
     def compute_loss(self, model, inputs, return_outputs=False):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
@@ -343,14 +348,18 @@ class LMTrainer(Trainer):
             labels = inputs.pop("labels")
         else:
             labels = None
-        outputs = model(**inputs, return_dict=True)
+        outputs = model(**inputs)
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
 
         if labels is not None:
-            if unwrap_model(model)._get_name() in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+            if is_peft_available() and isinstance(model, PeftModel):
+                model_name = unwrap_model(model.base_model)._get_name()
+            else:
+                model_name = unwrap_model(model)._get_name()
+            if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
                 loss = self.label_smoother(outputs, labels, shift_labels=True)
             else:
                 loss = self.label_smoother(outputs, labels)
@@ -465,28 +474,32 @@ class LMTrainer(Trainer):
                     if self.args.past_index >= 0:
                         self._past = outputs[self.args.past_index - 1]
 
-        logits = nested_detach(logits)
+        # if prediction_loss_only:
+            # return (loss, None, None)
+
+        # logits = nested_detach(logits)
         if len(logits) == 1:
             logits = logits[0]
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        
-        # print("logits:", logits)
-        preds = logits.argmax(dim=2)[..., :-1]                                              # [bsz, seq_len-1]
+            
+        logits = nested_detach(logits)
+        preds = logits.argmax(dim=2)[..., :-1]            # [bsz, seq_len-1]
         # print("preds:", preds)
-        true_labels = labels[..., 1:]                                                       # [bsz, seq_len-1]
+        true_labels = labels[..., 1:]                     # [bsz, seq_len-1]
         # print("labels:", true_labels)
-        assert len(preds) == len(true_labels) and len(preds[0]) == len(true_labels[0])      # [bsz, seq_len]
+        assert len(preds) == len(true_labels) and len(preds[0]) == len(true_labels[0])       # [bsz, seq_len]
         right_preds_raw = (preds == true_labels).float()
         right = sum([sum([p if l not in (-100, self.tokenizer.eos_token_id,) else 0 for p, l in zip(ith_pred, ith_label)]) for ith_pred, ith_label in zip(right_preds_raw, true_labels)])
-        total = sum([sum([1 if lbl not in (-100, self.tokenizer.eos_token_id,) else 0 for lbl in label]) for label in true_labels])
+        total = sum([sum([1 if l not in (-100, self.tokenizer.eos_token_id,) else 0 for l in label]) for label in true_labels])
         # assert total == len(true_labels)
         total = torch.Tensor([total]).to(loss)
         right = torch.Tensor([right]).to(loss)
+        
         if prediction_loss_only:
             return (loss, right, total, None, None)
+        
         return (loss, right, total, logits, labels)
-
+        # return (loss, logits, labels)
+    
     def evaluation_loop(
         self,
         dataloader: DataLoader,
@@ -504,18 +517,29 @@ class LMTrainer(Trainer):
 
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
 
-        # if eval is called w/o train init deepspeed here
-        if args.deepspeed and not self.deepspeed:
-            # XXX: eval doesn't have `resume_from_checkpoint` arg but we should be able to do eval
-            # from the checkpoint eventually
-            deepspeed_engine, _, _ = deepspeed_init(
-                self, num_training_steps=0, resume_from_checkpoint=None, inference=True
-            )
-            self.model = deepspeed_engine.module
-            self.model_wrapped = deepspeed_engine
-            self.deepspeed = deepspeed_engine
+        # if eval is called w/o train, handle model prep here
+        if self.is_deepspeed_enabled and self.model_wrapped is self.model:
+            _, _ = deepspeed_init(self, num_training_steps=0, inference=True)
 
         model = self._wrap_model(self.model, training=False, dataloader=dataloader)
+
+        if len(self.accelerator._models) == 0 and model is self.model:
+            model = (
+                self.accelerator.prepare(model)
+                if self.is_deepspeed_enabled
+                else self.accelerator.prepare_model(model, evaluation_mode=True)
+            )
+
+            if self.is_fsdp_enabled:
+                self.model = model
+
+            # for the rest of this function `model` is the outside model, whether it was wrapped or not
+            if model is not self.model:
+                self.model_wrapped = model
+
+            # backward compatibility
+            if self.is_deepspeed_enabled:
+                self.deepspeed = self.model_wrapped
 
         # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
         # while ``train`` is running, cast it to the right dtype first and then put on device
@@ -594,8 +618,6 @@ class LMTrainer(Trainer):
                 totals_host = totals if totals_host is None else torch.cat((totals_host, totals), dim=0)
             if labels is not None:
                 labels = self._pad_across_processes(labels)
-                labels = self._nested_gather(labels)
-                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
             if inputs_decode is not None:
                 inputs_decode = self._pad_across_processes(inputs_decode)
                 inputs_decode = self._nested_gather(inputs_decode)
@@ -606,10 +628,13 @@ class LMTrainer(Trainer):
                 )
             if logits is not None:
                 logits = self._pad_across_processes(logits)
-                logits = self._nested_gather(logits)
                 if self.preprocess_logits_for_metrics is not None:
                     logits = self.preprocess_logits_for_metrics(logits, labels)
+                logits = self._nested_gather(logits)
                 preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+            if labels is not None:
+                labels = self._nested_gather(labels)
+                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
 
             # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
@@ -729,6 +754,71 @@ class LMTrainer(Trainer):
 
         return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples)
 
+    # def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+    #     """
+    #     Will save the model, so you can reload it using `from_pretrained()`.
+    #     Will only save from the main process.
+    #     """
+
+    #     if output_dir is None:
+    #         output_dir = self.args.output_dir
+
+    #     if is_torch_tpu_available():
+    #         self._save_tpu(output_dir)
+    #     elif is_sagemaker_mp_enabled():
+    #         # Calling the state_dict needs to be done on the wrapped model and on all processes.
+    #         os.makedirs(output_dir, exist_ok=True)
+    #         state_dict = self.model_wrapped.state_dict()
+    #         if self.args.should_save:
+    #             self._save(output_dir, state_dict=state_dict)
+    #         if IS_SAGEMAKER_MP_POST_1_10:
+    #             # 'user_content.pt' indicates model state_dict saved with smp >= 1.10
+    #             Path(os.path.join(output_dir, "user_content.pt")).touch()
+    #     elif (
+    #         ShardedDDPOption.ZERO_DP_2 in self.args.sharded_ddp
+    #         or ShardedDDPOption.ZERO_DP_3 in self.args.sharded_ddp
+    #         or self.fsdp is not None
+    #     ):
+    #         full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    #         with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
+    #             state_dict = self.model.state_dict()
+
+    #         if self.args.should_save:
+    #             self._save(output_dir, state_dict=state_dict)
+    #     elif self.deepspeed:
+    #         # this takes care of everything as long as we aren't under zero3
+    #         if self.args.should_save:
+    #             self._save(output_dir)
+
+    #         if is_deepspeed_zero3_enabled():
+    #             # It's too complicated to try to override different places where the weights dump gets
+    #             # saved, so since under zero3 the file is bogus, simply delete it. The user should
+    #             # either user deepspeed checkpoint to resume or to recover full weights use
+    #             # zero_to_fp32.py stored in the checkpoint.
+    #             if self.args.should_save:
+    #                 file = os.path.join(output_dir, WEIGHTS_NAME)
+    #                 if os.path.isfile(file):
+    #                     # logger.info(f"deepspeed zero3: removing {file}, see zero_to_fp32.py to recover weights")
+    #                     os.remove(file)
+
+    #             # now save the real model if stage3_gather_16bit_weights_on_model_save=True
+    #             # if false it will not be saved.
+    #             # This must be called on all ranks
+    #             if not self.deepspeed.save_16bit_model(output_dir, WEIGHTS_NAME):
+    #                 logger.warning(
+    #                     "deepspeed.save_16bit_model didn't save the model, since"
+    #                     " stage3_gather_16bit_weights_on_model_save=false. Saving the full checkpoint instead, use"
+    #                     " zero_to_fp32.py to recover weights"
+    #                 )
+    #                 self.deepspeed.save_checkpoint(output_dir)
+
+    #     elif self.args.should_save:
+    #         self._save(output_dir)
+
+    #     # Push to the Hub when `save_model` is called by the user.
+    #     if self.args.push_to_hub and not _internal_call:
+    #         self.push_to_hub(commit_message="Model save")
+    
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         """
         Will save the model, so you can reload it using `from_pretrained()`.
@@ -753,39 +843,34 @@ class LMTrainer(Trainer):
             ShardedDDPOption.ZERO_DP_2 in self.args.sharded_ddp
             or ShardedDDPOption.ZERO_DP_3 in self.args.sharded_ddp
             or self.fsdp is not None
+            or self.is_fsdp_enabled
         ):
-            full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
-                state_dict = self.model.state_dict()
-
+            state_dict = self.model.state_dict() if not self.is_fsdp_enabled else {}
             if self.args.should_save:
                 self._save(output_dir, state_dict=state_dict)
-        elif self.deepspeed:
-            # this takes care of everything as long as we aren't under zero3
-            if self.args.should_save:
-                self._save(output_dir)
-
-            if is_deepspeed_zero3_enabled():
-                # It's too complicated to try to override different places where the weights dump gets
-                # saved, so since under zero3 the file is bogus, simply delete it. The user should
-                # either user deepspeed checkpoint to resume or to recover full weights use
-                # zero_to_fp32.py stored in the checkpoint.
+            if self.is_fsdp_enabled:
+                # remove the dummy state_dict saved above
                 if self.args.should_save:
-                    file = os.path.join(output_dir, WEIGHTS_NAME)
-                    if os.path.isfile(file):
-                        # logger.info(f"deepspeed zero3: removing {file}, see zero_to_fp32.py to recover weights")
-                        os.remove(file)
+                    for filename in [WEIGHTS_NAME, SAFE_WEIGHTS_NAME]:
+                        file = os.path.join(output_dir, filename)
+                        if os.path.isfile(file):
+                            os.remove(file)
+                save_fsdp_model(self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir)
 
-                # now save the real model if stage3_gather_16bit_weights_on_model_save=True
-                # if false it will not be saved.
-                # This must be called on all ranks
-                if not self.deepspeed.save_16bit_model(output_dir, WEIGHTS_NAME):
-                    logger.warning(
-                        "deepspeed.save_16bit_model didn't save the model, since"
-                        " stage3_gather_16bit_weights_on_model_save=false. Saving the full checkpoint instead, use"
-                        " zero_to_fp32.py to recover weights"
-                    )
-                    self.deepspeed.save_checkpoint(output_dir)
+        elif self.is_deepspeed_enabled:
+            # this takes care of everything as long as we aren't under zero3
+            if version.parse(accelerate_version) <= version.parse("0.20.3"):
+                raise ValueError("Install Accelerate from main branch")
+            try:
+                state_dict = self.accelerator.get_state_dict(self.deepspeed)
+                if self.args.should_save:
+                    self._save(output_dir, state_dict=state_dict)
+            except ValueError:
+                logger.warning(
+                    " stage3_gather_16bit_weights_on_model_save=false. Saving the full checkpoint instead, use"
+                    " zero_to_fp32.py to recover weights"
+                )
+                self.model_wrapped.save_checkpoint(output_dir)
 
         elif self.args.should_save:
             self._save(output_dir)
@@ -799,13 +884,15 @@ class LMTrainer(Trainer):
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Saving model checkpoint to {output_dir}")
+
+        supported_classes = (PreTrainedModel,) if not is_peft_available() else (PreTrainedModel, PeftModel)
         # Save a trained model and configuration using `save_pretrained()`.
         # They can then be reloaded using `from_pretrained()`
-        if not isinstance(self.model, PreTrainedModel):
+        if not isinstance(self.model, supported_classes):
             if state_dict is None:
                 state_dict = self.model.state_dict()
 
-            if isinstance(unwrap_model(self.model), PreTrainedModel):
+            if isinstance(unwrap_model(self.model), supported_classes):
                 unwrap_model(self.model).save_pretrained(
                     output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors
                 )
@@ -825,14 +912,15 @@ class LMTrainer(Trainer):
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-    
+
     def _save_checkpoint(self, model, trial, metrics=None):
-        # save_checkpoint() -> save_model() -> _save()
         # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
         # want to save except FullyShardedDDP.
         # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
+
         # Save model checkpoint
-        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{math.ceil(self.state.epoch)}"
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        # checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{math.ceil(self.state.epoch)}"
 
         if self.hp_search_backend is None and trial is None:
             self.store_flos()
@@ -841,29 +929,34 @@ class LMTrainer(Trainer):
         output_dir = os.path.join(run_dir, checkpoint_folder)
         self.save_model(output_dir, _internal_call=True)
 
-        if self.deepspeed and not self.args.ignore_opt_states:
+        if self.is_deepspeed_enabled and not self.args.ignore_opt_states:
             # under zero3 model file itself doesn't get saved since it's bogus! Unless deepspeed
             # config `stage3_gather_16bit_weights_on_model_save` is True
-            self.deepspeed.save_checkpoint(output_dir)
-        # exit()
+            self.model_wrapped.save_checkpoint(output_dir)
+
         # Save optimizer and scheduler
         if self.sharded_ddp == ShardedDDPOption.SIMPLE:
             self.optimizer.consolidate_state_dict()
 
-        if self.fsdp:
-            # FSDP has a different interface for saving optimizer states.
-            # Needs to be called on all ranks to gather all states.
-            # full_optim_state_dict will be deprecated after Pytorch 2.2!
-            full_osd = self.model.__class__.full_optim_state_dict(self.model, self.optimizer)
-
         if not self.args.ignore_opt_states:                         # if ignore_opt_states=True, then can't continual training
+            if self.fsdp or self.is_fsdp_enabled:
+                if self.is_fsdp_enabled:
+                    save_fsdp_optimizer(
+                        self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
+                    )
+                else:
+                    # FSDP has a different interface for saving optimizer states.
+                    # Needs to be called on all ranks to gather all states.
+                    # full_optim_state_dict will be deprecated after Pytorch 2.2!
+                    full_osd = self.model.__class__.full_optim_state_dict(self.model, self.optimizer)
+                    torch.save(full_osd, os.path.join(output_dir, OPTIMIZER_NAME))
+
             if is_torch_tpu_available():
                 xm.rendezvous("saving_optimizer_states")
                 xm.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
                 with warnings.catch_warnings(record=True) as caught_warnings:
                     xm.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
                     reissue_pt_warnings(caught_warnings)
-            
             elif is_sagemaker_mp_enabled():
                 opt_state_dict = self.optimizer.local_state_dict(gather_if_shard=False)
                 smp.barrier()
@@ -880,12 +973,9 @@ class LMTrainer(Trainer):
                     reissue_pt_warnings(caught_warnings)
                     if self.do_grad_scaling:
                         torch.save(self.scaler.state_dict(), os.path.join(output_dir, SCALER_NAME))
-            elif self.args.should_save and not self.deepspeed:
+            elif self.args.should_save and not self.is_deepspeed_enabled and not (self.fsdp or self.is_fsdp_enabled):
                 # deepspeed.save_checkpoint above saves model/optim/sched
-                if self.fsdp:
-                    torch.save(full_osd, os.path.join(output_dir, OPTIMIZER_NAME))
-                else:
-                    torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+                torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
 
                 with warnings.catch_warnings(record=True) as caught_warnings:
                     torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))

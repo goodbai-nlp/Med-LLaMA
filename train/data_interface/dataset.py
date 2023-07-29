@@ -103,7 +103,7 @@ class DataCollatorForCausalLM:
 def get_raw_dataset(dataset_name, output_path, seed, local_rank):
     if dataset_name.endswith("pubmed-abs"):
         return PubMedDataset(output_path, seed, local_rank, dataset_name)
-    elif dataset_name.endswith("trucated-pubmedqa"):
+    elif dataset_name.endswith("pubmedqa"):
         return TrucatedPubMedQADataset(output_path, seed, local_rank, dataset_name)
     else:
         raise RuntimeError(
